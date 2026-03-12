@@ -11,6 +11,7 @@ const cron = require('node-cron');
 const { v4: uuidv4 } = require('uuid');
 const path = require('path');
 const fs = require('fs');
+const axios = require('axios'); // <-- নতুন যুক্ত করা হয়েছে
 
 const { detectPlatform, detectMediaType, isValidUrl, normalizeUrl } = require('./platformDetector');
 const { extractInfo, downloadMedia, generateThumbnail, autoUpdateYtDlp, cleanupTemp } = require('./downloader');
@@ -332,7 +333,7 @@ app.get('/api/formats', async (req, res) => {
       platform: meta.platform,
       media_type: meta.media_type,
       title: meta.title,
-      formats: meta.formats || [],
+      formats: meta.formats ||[],
     });
   } catch (err) {
     return res.status(500).json({ success: false, error: err.message });
@@ -358,6 +359,64 @@ app.get('/api/thumbnail', async (req, res) => {
     return res.json({ success: true, thumbnail: null, source: 'none', message: 'No thumbnail available' });
   } catch (err) {
     return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── GET /api/proxy (CORS Bypass Video Player) ──────────────────────────────
+// <-- এটিই সেই নতুন কোড যা ভিডিও প্লে ব্লকিং বাইপাস করবে
+
+app.get('/api/proxy', async (req, res) => {
+  const targetUrl = req.query.url;
+  
+  if (!targetUrl) {
+    return res.status(400).json({ success: false, error: 'Video URL is required' });
+  }
+
+  try {
+    // সোশ্যাল মিডিয়াকে বোকা বানানোর জন্য Fake Headers
+    const headers = {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36',
+      'Referer': 'https://www.google.com/',
+      'Accept': '*/*'
+    };
+
+    // ভিডিও টেনে দেখার (Scrubbing) জন্য Range header পাস করা
+    if (req.headers.range) {
+      headers['Range'] = req.headers.range;
+    }
+
+    // মূল ভিডিও সার্ভার থেকে ভিডিওটি স্ট্রিম হিসেবে রিকোয়েস্ট করা
+    const response = await axios({
+      method: 'get',
+      url: targetUrl,
+      responseType: 'stream',
+      headers: headers,
+      validateStatus: (status) => status >= 200 && status < 400
+    });
+
+    // ব্রাউজারের CORS ব্লক বাইপাস করার জন্য Header সেট করা
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+    res.setHeader('Content-Type', response.headers['content-type'] || 'video/mp4');
+
+    if (response.headers['content-length']) {
+      res.setHeader('Content-Length', response.headers['content-length']);
+    }
+    if (response.headers['content-range']) {
+      res.setHeader('Content-Range', response.headers['content-range']);
+    }
+    if (response.headers['accept-ranges']) {
+      res.setHeader('Accept-Ranges', response.headers['accept-ranges']);
+    }
+
+    res.status(response.status);
+    response.data.pipe(res);
+
+  } catch (err) {
+    console.error('[proxy]', err.message);
+    if (!res.headersSent) {
+      res.status(500).json({ success: false, error: 'Error proxying video' });
+    }
   }
 });
 
@@ -406,7 +465,7 @@ cron.schedule('0 * * * *', () => {
 
 async function startup() {
   // Ensure data directories
-  const dirs = [
+  const dirs =[
     process.env.TEMP_PATH || '/data/temp',
     process.env.CACHE_PATH || '/data/cache',
     process.env.COOKIE_PATH || '/data/cookies',
