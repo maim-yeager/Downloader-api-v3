@@ -1,5 +1,5 @@
 # Dockerfile
-FROM node:20-slim
+FROM node:20-slim AS base
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
@@ -12,37 +12,35 @@ RUN apt-get update && apt-get install -y \
     tzdata \
     && rm -rf /var/lib/apt/lists/*
 
-# Install yt-dlp with fallback methods
-RUN pip3 install --break-system-packages yt-dlp || \
-    pip3 install yt-dlp || \
-    (curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp && \
-    chmod a+rx /usr/local/bin/yt-dlp)
+# Install yt-dlp
+RUN pip3 install yt-dlp || \
+    curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp && \
+    chmod a+rx /usr/local/bin/yt-dlp
 
-# Verify installations and create symlink if needed
-RUN yt-dlp --version || ln -s /usr/local/bin/yt-dlp /usr/bin/yt-dlp || true && \
+# Verify installations
+RUN yt-dlp --version || true && \
     ffmpeg -version | head -1
+
+# Production stage
+FROM base AS production
 
 WORKDIR /app
 
-# Copy package files first for better caching
+# Copy package files
 COPY package*.json ./
 
-# Install Node dependencies with clean install
+# Install Node dependencies
 RUN npm ci --only=production --no-audit --no-fund
 
 # Copy application files
 COPY . .
 
-# Create data directories with proper permissions
+# Create data directories
 RUN mkdir -p /data/cookies /data/cache /data/temp /data/logs /data/backups && \
-    chmod -R 755 /data && \
-    chown -R node:node /data || true
+    chmod -R 755 /data
 
-# Copy and setup init script
+# Run init script
 RUN node init-folders.js || true
-
-# Set non-root user for security (optional)
-# USER node
 
 # Expose port
 EXPOSE 3002
@@ -51,14 +49,28 @@ EXPOSE 3002
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
   CMD curl -f http://localhost:3002/health || exit 1
 
-# Use tini for better signal handling
-RUN apt-get update && apt-get install -y tini && rm -rf /var/lib/apt/lists/*
-
-# Start server with tini
-ENTRYPOINT ["/usr/bin/tini", "--"]
+# Start server
 CMD ["node", "server.js"]
 
-# Add metadata
-LABEL maintainer="Maim Islam" \
-      version="1.0.0" \
-      description="Social Media Downloader API"
+# Development stage
+FROM base AS development
+
+WORKDIR /app
+
+# Copy package files
+COPY package*.json ./
+
+# Install all dependencies (including dev)
+RUN npm install
+
+# Copy application files
+COPY . .
+
+# Create data directories
+RUN mkdir -p /data/cookies /data/cache /data/temp /data/logs /data/backups
+
+# Expose port
+EXPOSE 3002
+
+# Run in development mode
+CMD ["npm", "run", "dev"]
