@@ -3,15 +3,53 @@ primary_region = "sin"
 
 [build]
   dockerfile = "Dockerfile"
+  build_target = "production"
+  build_args = {
+    NODE_VERSION = "20"
+  }
 
 [env]
   PORT = "3002"
   NODE_ENV = "production"
+  NPM_CONFIG_PRODUCTION = "true"
+  NPM_CONFIG_LOGLEVEL = "error"
+  NODE_OPTIONS = "--max-old-space-size=512"
+  
+  # Paths
+  DATA_PATH = "/data"
   CACHE_PATH = "/data/cache"
   COOKIE_PATH = "/data/cookies"
   DB_PATH = "/data/database.sqlite"
   TEMP_PATH = "/data/temp"
   LOG_PATH = "/data/logs"
+  BACKUP_PATH = "/data/backups"
+  
+  # Cache settings
+  CACHE_TTL_HOURS = "24"
+  MAX_CACHE_SIZE_MB = "500"
+  MAX_CACHE_FILES = "1000"
+  
+  # Cookie settings
+  COOKIE_FAIL_THRESHOLD = "5"
+  MAX_COOKIE_AGE_DAYS = "30"
+  
+  # Download settings
+  MAX_FILE_SIZE = "1073741824"
+  TEMP_RETENTION_HOURS = "1"
+  CONCURRENT_FRAGMENTS = "4"
+  
+  # Rate limiting
+  RATE_LIMIT_WINDOW_MS = "60000"
+  RATE_LIMIT_MAX_REQUESTS = "60"
+  
+  # Logging
+  LOG_LEVEL = "info"
+  LOG_MAX_SIZE = "10m"
+  LOG_MAX_FILES = "7"
+  
+  # Backup
+  BACKUP_RETENTION_DAYS = "7"
+  STATS_RETENTION_DAYS = "90"
 
 [http_service]
   internal_port = 3002
@@ -19,28 +57,48 @@ primary_region = "sin"
   auto_stop_machines = false
   auto_start_machines = true
   min_machines_running = 1
+  max_machines_running = 5
 
   [http_service.concurrency]
     type = "connections"
-    hard_limit = 100
-    soft_limit = 80
+    hard_limit = 250
+    soft_limit = 200
+
+  [[http_service.checks]]
+    interval = "30s"
+    timeout = "10s"
+    grace_period = "15s"
+    method = "GET"
+    path = "/health"
+    protocol = "http"
 
 [[vm]]
   cpu_kind = "shared"
   cpus = 2
-  memory_mb = 1024
+  memory_mb = 2048  # 2GB RAM
 
 [[mounts]]
   source = "social_media_data"
   destination = "/data"
   initial_size = "10gb"
 
-[checks]
-  [checks.health]
-    grace_period = "15s"
-    interval = "30s"
-    method = "GET"
-    path = "/health"
-    port = 3002
-    timeout = "10s"
-    type = "http"
+[[metrics]]
+  port = 3002
+  path = "/metrics"
+
+[deploy]
+  strategy = "rolling"
+  release_command = "node init-folders.js"
+
+[[services]]
+  protocol = "tcp"
+  internal_port = 3002
+
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+    force_https = true
+
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]

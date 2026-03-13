@@ -1,3 +1,4 @@
+// downloader.js
 'use strict';
 
 const { execFile, spawn } = require('child_process');
@@ -6,6 +7,7 @@ const execFileAsync = promisify(execFile);
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const os = require('os');
 require('dotenv').config();
 
 const { detectPlatform, detectMediaType, extractorToPlatform } = require('./platformDetector');
@@ -13,11 +15,17 @@ const { getCookiesForPlatform, buildCookieArgs, recordCookieResult } = require('
 const { getMetadataCache, setMetadataCache, getFileCache, setFileCache } = require('./cacheManager');
 const { downloadOps, statsOps } = require('./db');
 
-const TEMP_PATH = process.env.TEMP_PATH || '/data/temp';
+const TEMP_PATH = process.env.TEMP_PATH || path.join(os.tmpdir(), 'social-downloader');
 const CACHE_PATH = process.env.CACHE_PATH || '/data/cache';
+const YTDLP_PATH = process.env.YTDLP_PATH || 'yt-dlp';
+const FFMPEG_PATH = process.env.FFMPEG_PATH || 'ffmpeg';
+const MAX_FILE_SIZE = parseInt(process.env.MAX_FILE_SIZE) || 1024 * 1024 * 1024; // 1GB default
 
+// Ensure directories exist
 for (const dir of [TEMP_PATH, CACHE_PATH]) {
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o755 });
+  }
 }
 
 // ── User-Agent pool for bypass ─────────────────────────────────────────────
@@ -27,6 +35,8 @@ const USER_AGENTS = [
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
   'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:122.0) Gecko/20100101 Firefox/122.0',
+  'Mozilla/5.0 (Android 13; Mobile; rv:122.0) Gecko/122.0 Firefox/122.0',
 ];
 
 function randomUA() {
@@ -44,6 +54,7 @@ const FORMAT_SELECTORS = {
   '360p':  'bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=360]+bestaudio/best[height<=360]',
   'mp3':   'bestaudio[ext=m4a]/bestaudio/best',
   'audio': 'bestaudio[ext=m4a]/bestaudio/best',
+  'worst': 'worstvideo+worstaudio/worst',
 };
 
 // ── Base yt-dlp args ───────────────────────────────────────────────────────
@@ -55,6 +66,8 @@ function baseArgs(extraUA = true) {
     '--fragment-retries', '5',
     '--concurrent-fragments', '4',
     '--no-warnings',
+    '--no-call-home',
+    '--no-check-certificate',
   ];
   if (extraUA) args.push('--user-agent', randomUA());
   return args;
@@ -65,95 +78,137 @@ function baseArgs(extraUA = true) {
 function parseFormats(info) {
   const formats = info.formats || [];
 
+  // Filter out unwanted formats
+  const validFormats = formats.filter(f => 
+    f.protocol !== 'm3u8' || f.protocol !== 'm3u8_native' // Skip HLS streams
+  );
+
   const seen = new Set();
   const result = [];
 
   // Best quality first
   const ordered = [
-    { label: 'Best Quality', selector: 'best' },
-    { label: '4K',    height: 2160 },
-    { label: '2K',    height: 1440 },
-    { label: '1080p', height: 1080 },
-    { label: '720p',  height: 720 },
-    { label: '480p',  height: 480 },
-    { label: '360p',  height: 360 },
+    { label: 'Best Quality', selector: 'best', type: 'video' },
+    { label: '4K',    height: 2160, type: 'video' },
+    { label: '2K',    height: 1440, type: 'video' },
+    { label: '1080p', height: 1080, type: 'video' },
+    { label: '720p',  height: 720, type: 'video' },
+    { label: '480p',  height: 480, type: 'video' },
+    { label: '360p',  height: 360, type: 'video' },
+    { label: '240p',  height: 240, type: 'video' },
+    { label: '144p',  height: 144, type: 'video' },
   ];
 
+  // Add video formats
   for (const q of ordered) {
     if (q.selector === 'best') {
-      const best = formats
-        .filter(f => f.vcodec !== 'none' && f.acodec !== 'none')
+      const best = validFormats
+        .filter(f => f.vcodec !== 'none' && f.acodec !== 'none' && f.url)
         .sort((a, b) => (b.height || 0) - (a.height || 0))[0];
+      
       if (best && !seen.has('best')) {
         seen.add('best');
         result.push({
-          format_id: best.format_id,
+          format_id: best.format_id || 'best',
           format: 'Best Quality',
           resolution: best.height ? `${best.height}p` : 'N/A',
           fps: best.fps || null,
           ext: best.ext || 'mp4',
           type: 'video',
-          size: best.filesize ? formatBytes(best.filesize) : (best.filesize_approx ? formatBytes(best.filesize_approx) : 'N/A'),
-          size_bytes: best.filesize || best.filesize_approx || null,
+          size: formatBytes(best.filesize || best.filesize_approx),
+          size_bytes: best.filesize || best.filesize_approx || 0,
           tbr: best.tbr || null,
+          has_audio: true,
+          has_video: true,
+          url: best.url || null,
         });
       }
       continue;
     }
 
-    const match = formats
-      .filter(f => f.height && f.height <= q.height && f.height > (q.height - 200))
-      .sort((a, b) => (b.tbr || 0) - (a.tbr || 0))[0];
+    // Find formats for specific resolution
+    const matches = validFormats
+      .filter(f => f.vcodec !== 'none' && f.height && f.height <= q.height && f.height > (q.height - 200) && f.url)
+      .sort((a, b) => (b.tbr || 0) - (a.tbr || 0));
+
+    const match = matches[0];
+    const audioMatch = validFormats.find(f => f.acodec !== 'none' && f.vcodec === 'none' && f.url);
 
     if (match && !seen.has(q.label)) {
       seen.add(q.label);
       result.push({
-        format_id: match.format_id,
+        format_id: match.format_id || q.label.toLowerCase(),
         format: q.label,
         resolution: `${match.height}p`,
         fps: match.fps || null,
         ext: match.ext || 'mp4',
         type: 'video',
-        size: match.filesize ? formatBytes(match.filesize) : (match.filesize_approx ? formatBytes(match.filesize_approx) : 'N/A'),
-        size_bytes: match.filesize || match.filesize_approx || null,
+        size: formatBytes(match.filesize || match.filesize_approx),
+        size_bytes: match.filesize || match.filesize_approx || 0,
         tbr: match.tbr || null,
+        has_audio: !!audioMatch,
+        has_video: true,
+        url: match.url || null,
       });
     }
   }
 
-  // Add audio
-  const audio = formats
-    .filter(f => f.vcodec === 'none' && f.acodec !== 'none')
-    .sort((a, b) => (b.tbr || 0) - (a.tbr || 0))[0];
+  // Add audio formats
+  const audioFormats = validFormats
+    .filter(f => f.vcodec === 'none' && f.acodec !== 'none' && f.url)
+    .sort((a, b) => (b.tbr || 0) - (a.tbr || 0));
 
-  if (audio) {
+  if (audioFormats.length > 0) {
+    const bestAudio = audioFormats[0];
     result.push({
-      format_id: audio.format_id,
-      format: 'Audio MP3',
+      format_id: bestAudio.format_id || 'audio',
+      format: 'Audio',
       resolution: 'audio only',
       fps: null,
       ext: 'mp3',
       type: 'audio',
-      size: audio.filesize ? formatBytes(audio.filesize) : (audio.filesize_approx ? formatBytes(audio.filesize_approx) : 'N/A'),
-      size_bytes: audio.filesize || audio.filesize_approx || null,
-      tbr: audio.tbr || null,
+      size: formatBytes(bestAudio.filesize || bestAudio.filesize_approx),
+      size_bytes: bestAudio.filesize || bestAudio.filesize_approx || 0,
+      tbr: bestAudio.tbr || null,
+      has_audio: true,
+      has_video: false,
+      url: bestAudio.url || null,
     });
+
+    // Add MP3 as separate if available
+    if (bestAudio.tbr > 64) {
+      result.push({
+        format_id: 'mp3',
+        format: 'MP3',
+        resolution: 'audio only',
+        fps: null,
+        ext: 'mp3',
+        type: 'audio',
+        size: formatBytes(bestAudio.filesize || bestAudio.filesize_approx),
+        size_bytes: bestAudio.filesize || bestAudio.filesize_approx || 0,
+        tbr: bestAudio.tbr || null,
+        has_audio: true,
+        has_video: false,
+        url: bestAudio.url || null,
+      });
+    }
   }
 
   return result;
 }
 
 function formatBytes(bytes) {
-  if (!bytes) return 'N/A';
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+  if (!bytes || bytes <= 0) return 'Unknown';
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+  return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
 }
 
 function buildMetadata(info, platform) {
   const detectedPlatform = platform || extractorToPlatform(info.extractor_key || info.extractor);
 
-  // Detect media type from entries (playlist = carousel)
+  // Detect media type
   let mediaType = 'video';
   let items = null;
 
@@ -164,6 +219,7 @@ function buildMetadata(info, platform) {
       preview_url: e.thumbnail || null,
       download_url: e.url || e.webpage_url || null,
       title: e.title || null,
+      duration: e.duration || null,
     }));
   } else if (info.is_live) {
     mediaType = 'live';
@@ -184,6 +240,7 @@ function buildMetadata(info, platform) {
     upload_date: info.upload_date || null,
     view_count: info.view_count || null,
     like_count: info.like_count || null,
+    comment_count: info.comment_count || null,
     thumbnail: info.thumbnail || (info.thumbnails && info.thumbnails[info.thumbnails.length - 1]?.url) || null,
     preview_url: info.url || info.manifest_url || null,
     preview_type: mediaType === 'carousel' ? 'carousel' : (mediaType === 'photo' ? 'image' : 'video'),
@@ -192,6 +249,7 @@ function buildMetadata(info, platform) {
     formats,
     webpage_url: info.webpage_url || null,
     extractor: info.extractor_key || info.extractor || null,
+    timestamp: info.timestamp || null,
   };
 }
 
@@ -210,26 +268,28 @@ async function runYtDlpWithFallback(url, args, platform) {
     const fullArgs = [...args, ...cookieArgs, '--user-agent', randomUA()];
 
     try {
-      const result = await execFileAsync('yt-dlp', fullArgs, {
+      const result = await execFileAsync(YTDLP_PATH, fullArgs, {
         maxBuffer: 50 * 1024 * 1024,
         timeout: 120000,
+        killSignal: 'SIGKILL',
       });
 
       if (cookie) {
-        recordCookieResult(cookie.id, platform, true);
+        await recordCookieResult(cookie.id, platform, true);
       }
 
       return result;
     } catch (err) {
       lastError = err;
       if (cookie) {
-        recordCookieResult(cookie.id, platform, false, err.message);
+        await recordCookieResult(cookie.id, platform, false, err.message);
       }
 
       // Don't retry on non-auth errors
       const msg = (err.stderr || err.message || '').toLowerCase();
       if (!msg.includes('login') && !msg.includes('auth') && !msg.includes('private') &&
-          !msg.includes('cookie') && !msg.includes('403') && !msg.includes('sign in')) {
+          !msg.includes('cookie') && !msg.includes('403') && !msg.includes('sign in') &&
+          !msg.includes('member') && !msg.includes('unavailable')) {
         throw err;
       }
     }
@@ -240,7 +300,7 @@ async function runYtDlpWithFallback(url, args, platform) {
 
 // ── Extract media info ─────────────────────────────────────────────────────
 
-async function extractInfo(url, platform) {
+async function extractInfo(url, platform = null) {
   // Check metadata cache
   const cached = getMetadataCache(url);
   if (cached) return cached;
@@ -250,36 +310,47 @@ async function extractInfo(url, platform) {
     '--dump-json',
     '--no-download',
     '--flat-playlist',
+    '--ignore-errors',
     url,
   ];
 
-  const { stdout } = await runYtDlpWithFallback(url, args, platform);
+  try {
+    const { stdout } = await runYtDlpWithFallback(url, args, platform);
 
-  // yt-dlp may output multiple JSON lines for playlists
-  const lines = stdout.trim().split('\n').filter(Boolean);
-  let info;
+    // yt-dlp may output multiple JSON lines for playlists
+    const lines = stdout.trim().split('\n').filter(Boolean);
+    let info;
 
-  if (lines.length > 1) {
-    // Carousel / playlist — build aggregate
-    const entries = lines.map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
-    info = {
-      _type: 'playlist',
-      title: entries[0]?.title || 'Carousel',
-      entries,
-      thumbnail: entries[0]?.thumbnail || null,
-      extractor_key: entries[0]?.extractor_key || null,
-      extractor: entries[0]?.extractor || null,
-    };
-  } else {
-    info = JSON.parse(lines[0]);
+    if (lines.length > 1) {
+      // Carousel / playlist — build aggregate
+      const entries = lines.map(l => { 
+        try { return JSON.parse(l); } 
+        catch { return null; } 
+      }).filter(Boolean);
+      
+      info = {
+        _type: 'playlist',
+        title: entries[0]?.title || 'Carousel',
+        entries,
+        thumbnail: entries[0]?.thumbnail || null,
+        extractor_key: entries[0]?.extractor_key || null,
+        extractor: entries[0]?.extractor || null,
+      };
+    } else {
+      info = JSON.parse(lines[0]);
+    }
+
+    const meta = buildMetadata(info, platform);
+
+    // Cache it (24 hours)
+    setMetadataCache(url, meta.platform, meta.media_type, meta, 24);
+
+    return meta;
+
+  } catch (error) {
+    console.error('[extractInfo]', error.message);
+    throw new Error(`Failed to extract info: ${error.message}`);
   }
-
-  const meta = buildMetadata(info, platform);
-
-  // Cache it
-  setMetadataCache(url, meta.platform, meta.media_type, meta);
-
-  return meta;
 }
 
 // ── Download progress tracking ─────────────────────────────────────────────
@@ -290,6 +361,7 @@ function parseProgress(line) {
     /\[download\]\s+(\d+\.?\d*)%\s+of\s+([\d.]+\s*\w+)\s+at\s+([\d.]+\s*\w+\/s)(?:\s+ETA\s+([\d:]+))?/
   );
   if (!match) return null;
+  
   return {
     percentage: parseFloat(match[1]),
     total_size: match[2],
@@ -300,16 +372,17 @@ function parseProgress(line) {
 
 // ── Main download function ─────────────────────────────────────────────────
 
-async function downloadMedia(downloadId, url, format = 'best', platform, onProgress) {
+async function downloadMedia(downloadId, url, format = 'best', platform, onProgress = null) {
   const formatKey = format.toLowerCase().replace(/\s+/g, '');
   const isAudio = formatKey === 'mp3' || formatKey === 'audio';
 
   // Check file cache
   const cachedFile = getFileCache(url, formatKey);
-  if (cachedFile) {
-    downloadOps.updateComplete(downloadId, cachedFile, fs.statSync(cachedFile).size);
+  if (cachedFile && fs.existsSync(cachedFile)) {
+    const size = fs.statSync(cachedFile).size;
+    downloadOps.updateComplete(downloadId, cachedFile, size);
     statsOps.record(platform, isAudio ? 'audio' : 'video', true);
-    return { file_path: cachedFile, from_cache: true };
+    return { file_path: cachedFile, from_cache: true, size };
   }
 
   const outputFilename = `${downloadId}.%(ext)s`;
@@ -346,6 +419,7 @@ async function downloadMedia(downloadId, url, format = 'best', platform, onProgr
     const cookies = getCookiesForPlatform(platform);
     let cookieIndex = -1; // start with no cookie
     let currentProcess = null;
+    let cancelled = false;
 
     const tryDownload = () => {
       cookieIndex++;
@@ -358,7 +432,7 @@ async function downloadMedia(downloadId, url, format = 'best', platform, onProgr
       const cookieArgs = cookie ? buildCookieArgs(cookie.cookie_file_path) : [];
       const fullArgs = [...args, ...cookieArgs, '--user-agent', randomUA()];
 
-      const proc = spawn('yt-dlp', fullArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
+      const proc = spawn(YTDLP_PATH, fullArgs, { stdio: ['ignore', 'pipe', 'pipe'] });
       currentProcess = proc;
 
       let stderr = '';
@@ -386,7 +460,9 @@ async function downloadMedia(downloadId, url, format = 'best', platform, onProgr
         stderr += chunk.toString();
       });
 
-      proc.on('close', code => {
+      proc.on('close', async code => {
+        if (cancelled) return;
+
         if (code === 0) {
           // Find output file
           const files = fs.readdirSync(TEMP_PATH).filter(f => f.startsWith(downloadId));
@@ -398,27 +474,47 @@ async function downloadMedia(downloadId, url, format = 'best', platform, onProgr
           let outFile = files.find(f => f.endsWith(`.${ext}`)) || files[0];
           const finalPath = path.join(TEMP_PATH, outFile);
 
+          if (!fs.existsSync(finalPath)) {
+            return reject(new Error('Output file missing'));
+          }
+
           const size = fs.statSync(finalPath).size;
+          
+          // Check file size limit
+          if (size > MAX_FILE_SIZE) {
+            fs.unlinkSync(finalPath);
+            return reject(new Error(`File too large: ${formatBytes(size)} > ${formatBytes(MAX_FILE_SIZE)}`));
+          }
+
           downloadOps.updateComplete(downloadId, finalPath, size);
           statsOps.record(platform, isAudio ? 'audio' : 'video', true);
 
-          if (cookie) recordCookieResult(cookie.id, platform, true);
+          if (cookie) await recordCookieResult(cookie.id, platform, true);
 
           // Cache the file (copy to cache dir for longevity)
-          const cachedPath = path.join(CACHE_PATH, `${crypto.createHash('sha256').update(`${url}|${formatKey}`).digest('hex')}.${ext}`);
+          const cacheKey = crypto.createHash('sha256').update(`${url}|${formatKey}`).digest('hex');
+          const extCache = isAudio ? 'mp3' : (ext || 'mp4');
+          const cachedPath = path.join(CACHE_PATH, `${cacheKey}.${extCache}`);
+
           try {
-            fs.copyFileSync(finalPath, cachedPath);
-            setFileCache(url, platform, isAudio ? 'audio' : 'video', formatKey, cachedPath);
-          } catch { /* cache is best-effort */ }
+            // Don't cache if file is too large
+            if (size < 100 * 1024 * 1024) { // Only cache files < 100MB
+              fs.copyFileSync(finalPath, cachedPath);
+              setFileCache(url, platform, isAudio ? 'audio' : 'video', formatKey, cachedPath);
+            }
+          } catch (cacheErr) {
+            console.warn('[cache] Failed to cache file:', cacheErr.message);
+          }
 
           resolve({ file_path: finalPath, size, from_cache: false });
         } else {
-          if (cookie) recordCookieResult(cookie.id, platform, false, stderr);
+          if (cookie) await recordCookieResult(cookie.id, platform, false, stderr);
 
           const msg = stderr.toLowerCase();
           const isAuthError = msg.includes('login') || msg.includes('auth') ||
             msg.includes('private') || msg.includes('cookie') ||
-            msg.includes('403') || msg.includes('sign in');
+            msg.includes('403') || msg.includes('sign in') ||
+            msg.includes('member');
 
           if (isAuthError && cookieIndex <= cookies.length) {
             return tryDownload(); // try next cookie
@@ -435,7 +531,18 @@ async function downloadMedia(downloadId, url, format = 'best', platform, onProgr
       });
     };
 
+    // Allow cancellation
+    const cancelHandler = () => {
+      cancelled = true;
+      if (currentProcess) {
+        currentProcess.kill('SIGKILL');
+      }
+    };
+
     tryDownload();
+
+    // Return cancel function
+    return cancelHandler;
   });
 }
 
@@ -443,7 +550,7 @@ async function downloadMedia(downloadId, url, format = 'best', platform, onProgr
 
 async function generateThumbnail(videoPath, outputPath) {
   return new Promise((resolve, reject) => {
-    const proc = spawn('ffmpeg', [
+    const proc = spawn(FFMPEG_PATH, [
       '-i', videoPath,
       '-ss', '00:00:02',
       '-vframes', '1',
@@ -469,13 +576,41 @@ async function generateThumbnail(videoPath, outputPath) {
 async function autoUpdateYtDlp() {
   console.log('[yt-dlp] Checking for updates...');
   try {
-    const { stdout } = await execFileAsync('yt-dlp', ['--update'], { timeout: 60000 });
+    const { stdout } = await execFileAsync(YTDLP_PATH, ['--update'], { timeout: 60000 });
     const line = stdout.trim().split('\n').pop();
     console.log('[yt-dlp] Update result:', line);
-    return line;
+    
+    // Get version
+    const { stdout: versionOut } = await execFileAsync(YTDLP_PATH, ['--version']);
+    console.log('[yt-dlp] Version:', versionOut.trim());
+    
+    return versionOut.trim();
   } catch (err) {
     console.warn('[yt-dlp] Update check failed:', err.message);
     return 'Update check failed';
+  }
+}
+
+// ── Check if yt-dlp is installed ─────────────────────────────────────────
+
+async function checkYtDlp() {
+  try {
+    const { stdout } = await execFileAsync(YTDLP_PATH, ['--version']);
+    return { installed: true, version: stdout.trim() };
+  } catch {
+    return { installed: false, error: 'yt-dlp not found' };
+  }
+}
+
+// ── Check if ffmpeg is installed ─────────────────────────────────────────
+
+async function checkFfmpeg() {
+  try {
+    const { stdout } = await execFileAsync(FFMPEG_PATH, ['-version']);
+    const version = stdout.split('\n')[0] || 'unknown';
+    return { installed: true, version };
+  } catch {
+    return { installed: false, error: 'ffmpeg not found' };
   }
 }
 
@@ -484,6 +619,7 @@ async function autoUpdateYtDlp() {
 function cleanupTemp(maxAgeHours = 1) {
   const now = Date.now();
   let deleted = 0;
+  let totalSize = 0;
 
   try {
     const files = fs.readdirSync(TEMP_PATH);
@@ -492,15 +628,26 @@ function cleanupTemp(maxAgeHours = 1) {
       try {
         const stat = fs.statSync(fp);
         const ageHours = (now - stat.mtimeMs) / 3600000;
+        
         if (ageHours > maxAgeHours) {
+          totalSize += stat.size;
           fs.unlinkSync(fp);
           deleted++;
         }
-      } catch { /* ignore */ }
+      } catch (err) {
+        // Ignore errors
+      }
     }
-  } catch { /* ignore */ }
-
-  return deleted;
+    
+    if (deleted > 0) {
+      console.log(`[cleanup] Removed ${deleted} temp files (${formatBytes(totalSize)})`);
+    }
+    
+    return deleted;
+  } catch (err) {
+    console.error('[cleanup] Error:', err.message);
+    return 0;
+  }
 }
 
 module.exports = {
@@ -508,6 +655,8 @@ module.exports = {
   downloadMedia,
   generateThumbnail,
   autoUpdateYtDlp,
+  checkYtDlp,
+  checkFfmpeg,
   cleanupTemp,
   parseFormats,
   formatBytes,
